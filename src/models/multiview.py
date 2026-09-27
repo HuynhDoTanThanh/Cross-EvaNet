@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import einops
 
-from .eva_backbone import EVA_X, eva_x_base_patch16, load_with_pos_embed_interpolation
+from .eva_backbone import EVA_X, eva_x_base_patch16, load_evax_init_weights
 
 
 class MultiImageHybridEVA(nn.Module):
@@ -15,6 +15,9 @@ class MultiImageHybridEVA(nn.Module):
         super().__init__()
         self.n = n
         self.num_classes = num_classes
+        # ``backbone.head`` is kept although the VAAF model only uses the pooled
+        # feature z' (the parameter counts of Table 4 include it); it is the
+        # linear head of the ``fusion_head_type="linear"`` ablation.
         self.model = backbone
         self.embed_dim = self.model.embed_dim
         self.img_embed_matrix = nn.Parameter(
@@ -68,20 +71,26 @@ class MultiImageHybridEVA(nn.Module):
         features = self.model.forward_head(mv_tokens, pre_logits=True)
         if return_features:
             return features
-        logits = self.model.head(features)
-        return {"mv_collection": {"logits": logits}}
+        return self.model.head(features)
 
 
-def build_multiview_model(num_classes: int, cfg) -> MultiImageHybridEVA:
-    """Build multi-view model with optional pretrained_2 checkpoint."""
+def build_multiview_model(
+    num_classes: int, cfg, load_pretrained: bool = True
+) -> MultiImageHybridEVA:
+    """Build the multi-view encoder E_m.
+
+    With ``load_pretrained`` the bare backbone is initialised from
+    ``cfg.mv_init_ckpt`` (public EVA-X MIM weights, or a Phase-1 single-view
+    checkpoint) *before* it is wrapped; the view embeddings v_k keep their
+    Xavier-uniform init. Pass ``load_pretrained=False`` when the weights come
+    from a full Phase-2 checkpoint.
+    """
     backbone = eva_x_base_patch16(
         pretrained=False,
         drop_path_rate=cfg.drop_path_rate,
         img_size=cfg.img_size,
         num_classes=num_classes,
     )
-    model = MultiImageHybridEVA(backbone, num_classes=num_classes, n=cfg.num_views)
-    if isinstance(getattr(cfg, "pretrained_2", None), str):
-        print(f"Loading pretrained_2 weights from: {cfg.pretrained_2}")
-        model = load_with_pos_embed_interpolation(model, cfg.pretrained_2)
-    return model
+    if load_pretrained:
+        load_evax_init_weights(backbone, cfg.mv_init_ckpt)
+    return MultiImageHybridEVA(backbone, num_classes=num_classes, n=cfg.num_views)

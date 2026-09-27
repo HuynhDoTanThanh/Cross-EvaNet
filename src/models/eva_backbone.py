@@ -1,11 +1,9 @@
 """EVA backbone and checkpoint loading utilities."""
 
-import math
-from typing import Optional, Union
+from typing import Dict, Optional, Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from timm.layers import resample_abs_pos_embed, resample_patch_embed
 from timm.models.eva import Eva
 
@@ -16,12 +14,15 @@ def checkpoint_filter_fn(
     interpolation="bicubic",
     antialias=True,
 ):
-    """Convert patch embedding / pos_embed for compatibility."""
+    """timm's EVA checkpoint filter.
+
+    Remaps EVA-02 / MIM key names to timm, drops ``mask_token`` / ``lm_head`` /
+    rope buffers, moves the MIM ``norm`` to ``fc_norm`` and resamples
+    ``pos_embed`` / ``patch_embed`` to the model's grid (bicubic).
+    ``state_dict`` must already be unwrapped (``unwrap_state_dict``, which
+    prefers non-EMA weights).
+    """
     out_dict = {}
-    state_dict = state_dict.get("model_ema", state_dict)
-    state_dict = state_dict.get("model", state_dict)
-    state_dict = state_dict.get("module", state_dict)
-    state_dict = state_dict.get("state_dict", state_dict)
     if "visual.trunk.pos_embed" in state_dict:
         prefix = "visual.trunk."
     elif "visual.pos_embed" in state_dict:
@@ -83,41 +84,110 @@ def checkpoint_filter_fn(
     return out_dict
 
 
-def load_with_pos_embed_interpolation(
-    model: nn.Module, checkpoint_path: str, strict: bool = False
-) -> nn.Module:
-    """Load checkpoint and interpolate pos_embed if shape mismatch."""
+# Wrapper prefixes stripped when every key of a checkpoint carries them
+# (DataParallel / training-script containers / a TripleBranchEVA sub-module).
+_STRIP_PREFIXES = ("module.", "model.", "single_model.")
+# Containers unwrapped in order; non-EMA weights are preferred and EMA weights
+# are used only when no other container is present.
+_CONTAINER_KEYS = ("model", "module", "state_dict", "model_ema", "state_dict_ema")
+
+
+def unwrap_state_dict(checkpoint) -> Dict[str, torch.Tensor]:
+    """Return the bare state_dict of a checkpoint.
+
+    Unwraps ``model`` / ``module`` / ``state_dict`` containers (EMA only when
+    nothing else is present) and strips the ``module.``, ``model.`` and
+    ``single_model.`` prefixes when all keys share them.
+    """
+    state_dict = checkpoint.state_dict() if isinstance(checkpoint, nn.Module) else checkpoint
+    unwrapped = True
+    while unwrapped:
+        unwrapped = False
+        for key in _CONTAINER_KEYS:
+            value = state_dict.get(key)
+            if isinstance(value, dict):
+                state_dict = value
+                unwrapped = True
+                break
+    stripped = True
+    while stripped and state_dict:
+        stripped = False
+        for prefix in _STRIP_PREFIXES:
+            if all(k.startswith(prefix) for k in state_dict):
+                state_dict = {k[len(prefix):]: v for k, v in state_dict.items()}
+                stripped = True
+    return dict(state_dict)
+
+
+def load_evax_init_weights(model: "EVA_X", checkpoint_path: Optional[str]) -> str:
+    """Initialise a bare EVA-X backbone from public EVA-X or Phase-1 weights.
+
+    Used for the multi-view encoder E_m (before it is wrapped by
+    ``MultiImageHybridEVA``) and for Phase-1 single-view fine-tuning. The
+    source is auto-detected: a masked-image-modelling (MIM) checkpoint
+    (``mask_token`` / ``lm_head`` present) or a single-view classification
+    checkpoint such as the Phase-1 ``theta_s*``. Keys go through
+    ``checkpoint_filter_fn`` (EVA-02 -> timm key remap, drop ``mask_token`` /
+    ``lm_head`` / rope buffers, bicubic resampling of ``pos_embed`` e.g.
+    14x14 -> 28x28, and of ``patch_embed`` if needed).
+
+    Raises if no path is given, if any key other than ``head.weight`` /
+    ``head.bias`` is missing, or if any checkpoint key is unexpected.
+
+    Returns:
+        ``"mim"`` or ``"single_view"`` (the detected source).
+    """
+    if not checkpoint_path:
+        raise ValueError("An EVA-X checkpoint path is required to initialise the backbone.")
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    state_dict = checkpoint.get("model", checkpoint)
-    key = "model.pos_embed"
-    if key not in state_dict and "pos_embed" in state_dict:
-        key = "pos_embed"
-    if key in state_dict:
-        pos_embed_checkpoint = state_dict[key]
-        pos_embed_model = model.state_dict().get(key, None)
-        if pos_embed_model is not None and pos_embed_checkpoint.shape != pos_embed_model.shape:
-            print(f"Resizing {key}: {pos_embed_checkpoint.shape} -> {pos_embed_model.shape}")
-            cls_token = pos_embed_checkpoint[:, 0:1, :]
-            img_tokens = pos_embed_checkpoint[:, 1:, :]
-            n_tokens_old = img_tokens.shape[1]
-            grid_size_old = int(math.sqrt(n_tokens_old))
-            n_tokens_new = pos_embed_model.shape[1] - 1
-            grid_size_new = int(math.sqrt(n_tokens_new))
-            img_tokens = img_tokens.reshape(
-                1, grid_size_old, grid_size_old, -1
-            ).permute(0, 3, 1, 2)
-            img_tokens = F.interpolate(
-                img_tokens,
-                size=(grid_size_new, grid_size_new),
-                mode="bicubic",
-                align_corners=False,
-            )
-            img_tokens = img_tokens.permute(0, 2, 3, 1).flatten(1, 2)
-            new_pos_embed = torch.cat((cls_token, img_tokens), dim=1)
-            state_dict[key] = new_pos_embed
-    msg = model.load_state_dict(state_dict, strict=strict)
-    print("Load status:", msg)
-    return model
+    state_dict = unwrap_state_dict(checkpoint)
+    source = (
+        "mim"
+        if "mask_token" in state_dict or any(k.startswith("lm_head.") for k in state_dict)
+        else "single_view"
+    )
+    state_dict = checkpoint_filter_fn(state_dict, model)
+    # The classifier is (re)initialised when the checkpoint has none or a
+    # different label space; it is the only tolerated missing key.
+    for key in ("head.weight", "head.bias"):
+        if key in state_dict and state_dict[key].shape != model.state_dict()[key].shape:
+            print(f"Dropping {key} with shape {tuple(state_dict[key].shape)} (label space differs)")
+            del state_dict[key]
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    bad_missing = sorted(set(missing) - {"head.weight", "head.bias"})
+    if bad_missing or unexpected:
+        raise RuntimeError(
+            f"EVA-X checkpoint {checkpoint_path} does not match the backbone: "
+            f"missing={bad_missing}, unexpected={sorted(unexpected)}"
+        )
+    print(
+        f"Loaded {source} EVA-X weights from {checkpoint_path} "
+        f"({len(state_dict)} tensors; missing: {sorted(missing) or 'none'})"
+    )
+    return source
+
+
+def load_single_view_weights(model: "EVA_X", checkpoint_path: Optional[str]) -> None:
+    """Strictly load the Phase-1 single-view checkpoint ``theta_s*`` (encoder E_s).
+
+    The checkpoint must be a fine-tuned EVA-X classifier at the model's
+    resolution, including ``head.weight`` [C, D] and ``head.bias`` [C].
+    Containers and wrapper prefixes are removed; rope buffers are ignored.
+    """
+    if not checkpoint_path:
+        raise ValueError(
+            "Phase 2 requires the Phase-1 single-view checkpoint (theta_s*) for E_s."
+        )
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    state_dict = unwrap_state_dict(checkpoint)
+    if "mask_token" in state_dict or any(k.startswith("lm_head.") for k in state_dict):
+        raise ValueError(
+            f"{checkpoint_path} is a MIM pre-training checkpoint; E_s needs the "
+            "Phase-1 fine-tuned single-view checkpoint."
+        )
+    state_dict = {k: v for k, v in state_dict.items() if "rope" not in k}
+    model.load_state_dict(state_dict, strict=True)
+    print(f"Loaded Phase-1 single-view weights from {checkpoint_path}")
 
 
 class EVA_X(Eva):
@@ -154,7 +224,15 @@ def eva_x_base_patch16(
     img_size: int = 448,
     num_classes: int = 14,
 ) -> EVA_X:
-    """Build EVA-X base 448 patch16 with optional pretrained weights."""
+    """Build EVA-X base 448 patch16.
+
+    ``pretrained`` may be a path to public EVA-X (MIM) weights or to a
+    single-view EVA-X checkpoint; it is loaded with ``load_evax_init_weights``.
+    RoPE uses raw patch coordinates: its reference grid is the input grid
+    (28x28 at 448, 14x14 at 224). The rope buffers are not saved in
+    checkpoints, so every builder of a given ``img_size`` gets the same RoPE.
+    """
+    grid = img_size // 16
     model = EVA_X(
         img_size=img_size,
         patch_size=16,
@@ -166,14 +244,11 @@ def eva_x_base_patch16(
         swiglu_mlp=True,
         scale_mlp=True,
         use_rot_pos_emb=True,
-        ref_feat_shape=(28, 28),
+        ref_feat_shape=(grid, grid),
         drop_path_rate=drop_path_rate,
     )
     in_features = model.head.in_features
     model.head = nn.Linear(in_features, num_classes)
     if isinstance(pretrained, str):
-        print(f"Loading pretrained weights from: {pretrained}")
-        ckpt = torch.load(pretrained, map_location="cpu", weights_only=False)
-        msg = model.load_state_dict(ckpt, strict=False)
-        print(msg)
+        load_evax_init_weights(model, pretrained)
     return model

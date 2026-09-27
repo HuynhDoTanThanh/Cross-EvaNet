@@ -1,89 +1,118 @@
-"""Test/inference dataset for multi-view chest X-ray studies."""
+"""Evaluation / inference datasets for multi-view chest X-ray studies."""
 
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
+import pandas as pd
 import torch
-from PIL import Image, ImageFile
 from torch.utils.data import Dataset
 
-ImageFile.LOAD_TRUNCATED_IMAGES = True
+from src.constants import LABEL_COLUMNS
+
+from .study import (
+    STUDY_COLUMNS,
+    group_test_images,
+    is_test_image,
+    load_rgb_image,
+    study_labels,
+    study_pairs,
+)
 
 
-class TestMultiViewDataset(Dataset):
-    """Test dataset that discovers studies from a directory and builds sliding-window samples."""
+class MultiViewEvalDataset(Dataset):
+    """Deterministic study-level evaluation samples (no RNG).
+
+    Each study (key, image paths in slot/file order) is expanded into the
+    pairs of ``study_pairs``: a self-pair flagged ``single`` for one image,
+    else the windows of consecutive images. Items are dicts with ``images``
+    [2, C, H, W], ``image_names`` (the two names in slot order; a batch holds
+    one sequence per slot), ``study_key`` (str), ``single`` (bool) and, when
+    labels are given, ``labels`` [num_labels] (values in {0, 1}, or -1 for
+    uncertain).
+    """
 
     def __init__(
         self,
-        root_dir: str,
+        studies: Sequence[Tuple[str, Sequence[str]]],
+        image_dir: str,
         transform,
-        num_views: int = 3,
-        img_size: int = 448,
+        labels: Optional[np.ndarray] = None,
+        num_views: int = 2,
     ) -> None:
-        self.root_dir = root_dir
+        if num_views != 2:
+            raise ValueError(f"Only image pairs are supported (num_views=2), got {num_views}")
+        keys = [str(key) for key, _ in studies]
+        if len(set(keys)) != len(keys):
+            raise ValueError("Study keys must be unique")
+        if labels is not None and len(labels) != len(studies):
+            raise ValueError("labels must have one row per study")
+        self.image_dir = image_dir
         self.transform = transform
         self.num_views = num_views
-        self.img_size = img_size
+        self.labels = None if labels is None else np.asarray(labels, dtype=np.float32)
 
-        all_files = sorted(
-            [f for f in os.listdir(root_dir) if f.lower().endswith(".jpg")]
-        )
-        self.study_map: Dict[str, List[str]] = {}
-        for f in all_files:
-            parts = f.split("_")
-            if len(parts) >= 2:
-                study_key = f"{parts[0]}_{parts[1]}"
-            else:
-                study_key = f
-            if study_key not in self.study_map:
-                self.study_map[study_key] = []
-            self.study_map[study_key].append(f)
-
-        self.inference_samples: List[Dict[str, Any]] = []
-        for study_key, images in self.study_map.items():
-            images = sorted(images)
-            n_imgs = len(images)
-
-            if n_imgs < self.num_views:
-                self.inference_samples.append(
-                    {"study_key": study_key, "images": images, "needs_repeat": True}
+        self.samples: List[Dict[str, Any]] = []
+        for study_idx, (key, images) in enumerate(studies):
+            images = list(images)
+            for pair in study_pairs(images):
+                self.samples.append(
+                    {
+                        "study_key": str(key),
+                        "study_idx": study_idx,
+                        "images": pair,
+                        "single": len(images) == 1,
+                    }
                 )
-            else:
-                for i in range(n_imgs - self.num_views + 1):
-                    window = images[i : i + self.num_views]
-                    self.inference_samples.append(
-                        {
-                            "study_key": study_key,
-                            "images": window,
-                            "needs_repeat": False,
-                        }
-                    )
+
+    @classmethod
+    def from_dataframe(
+        cls,
+        df: pd.DataFrame,
+        image_dir: str,
+        transform,
+        num_views: int = 2,
+        label_columns: Optional[List[str]] = None,
+    ) -> "MultiViewEvalDataset":
+        """Validation studies from a train-format CSV (images in file-name order)."""
+        label_columns = label_columns or LABEL_COLUMNS
+        study_map = df.groupby(STUDY_COLUMNS)["Image_name"].apply(list).to_dict()
+        labels_df = study_labels(df, label_columns)
+        keys = list(study_map.keys())
+        studies = [
+            (f"{pid}_{study}", sorted(str(name) for name in study_map[(pid, study)]))
+            for pid, study in keys
+        ]
+        labels = labels_df.loc[keys].to_numpy(dtype=np.float32)
+        return cls(studies, image_dir, transform, labels=labels, num_views=num_views)
 
     def __len__(self) -> int:
-        return len(self.inference_samples)
+        return len(self.samples)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        sample = self.inference_samples[idx]
-        image_list = sample["images"]
+        sample = self.samples[idx]
+        tensor_stack = [
+            self.transform(load_rgb_image(os.path.join(self.image_dir, name)))
+            for name in sample["images"]
+        ]
+        item = {
+            "images": torch.stack(tensor_stack, dim=0),
+            "image_names": list(sample["images"]),
+            "study_key": sample["study_key"],
+            "single": sample["single"],
+        }
+        if self.labels is not None:
+            item["labels"] = torch.from_numpy(self.labels[sample["study_idx"]].copy())
+        return item
 
-        final_list: List[str] = []
-        if sample["needs_repeat"]:
-            i = 0
-            while len(final_list) < self.num_views:
-                final_list.append(image_list[i % len(image_list)])
-                i += 1
-        else:
-            final_list = image_list
 
-        tensor_stack = []
-        for img_name in final_list:
-            p = os.path.join(self.root_dir, img_name)
-            try:
-                img = Image.open(p).convert("RGB")
-                img = self.transform(img)
-                tensor_stack.append(img)
-            except Exception:
-                tensor_stack.append(torch.zeros((3, self.img_size, self.img_size)))
+class TestMultiViewDataset(MultiViewEvalDataset):
+    """Test dataset that discovers studies from a directory of images (jpg / png)."""
 
-        images = torch.stack(tensor_stack, dim=0)
-        return {"images": images, "study_key": sample["study_key"]}
+    def __init__(self, root_dir: str, transform, num_views: int = 2) -> None:
+        self.root_dir = root_dir
+        all_files = [f for f in os.listdir(root_dir) if is_test_image(f)]
+        self.study_map = group_test_images(all_files)
+        super().__init__(
+            list(self.study_map.items()), root_dir, transform, num_views=num_views
+        )

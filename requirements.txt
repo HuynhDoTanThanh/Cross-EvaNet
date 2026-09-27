@@ -1,16 +1,23 @@
+# Python >= 3.10
+#
+# Exact versions still need to be pinned from the author's `pip freeze` of the TPU v4 run
+# (torch, torch_xla, torchvision, timm, opencv). The lower bounds below are the minimum the
+# code needs; it was smoke-tested on CPU with torch 2.8.0, torchvision 0.23.0 and timm 1.0.9.
+
 # Core
 torch>=2.0.0
 torchvision>=0.15.0
-timm>=0.9.0
+timm>=0.9.6          # EVA with 2-D RoPE; Eva._pos_embed (used by the multi-view encoder) needs 0.9.6+
 einops>=0.6.0
 
-# Data & metrics
+# Data, metrics and statistics
 numpy>=1.24.0
 pandas>=2.0.0
 Pillow>=9.0.0
-opencv-python-headless>=4.5.0
+opencv-python-headless>=4.5.0  # CLAHE in Strong Augment (headless: no libGL needed on TPU / Docker hosts)
 scikit-learn>=1.2.0
+scipy>=1.10.0        # DeLong test / normal quantiles in scripts/statistics.py
 
-# TPU (optional; install on Kaggle/Colab TPU runtime)
+# TPU (optional): use a runtime that ships torch_xla matching torch, or install the matching
+# torch_xla wheel. It is imported only when --use-tpu is passed.
 # torch_xla
-# cloud-tpu-client

@@ -2,16 +2,20 @@
 
 from torch.utils.data import DataLoader
 
+from .test_dataset import MultiViewEvalDataset
 from .train_dataset import MultiViewXRayDataset
-from .transforms import build_transforms
 
 
 def make_loaders(train_df, val_df, cfg, train_tf, val_tf):
-    """Build train and val DataLoaders for multi-view dataset."""
+    """Build Phase-2 train and val DataLoaders.
+
+    Training draws a random pair per study; validation is deterministic
+    (file order, consecutive windows, single-image studies flagged).
+    """
     train_ds = MultiViewXRayDataset(
         train_df, cfg.train_dir, transform=train_tf, num_views=cfg.num_views
     )
-    val_ds = MultiViewXRayDataset(
+    val_ds = MultiViewEvalDataset.from_dataframe(
         val_df, cfg.train_dir, transform=val_tf, num_views=cfg.num_views
     )
     train_dl = DataLoader(

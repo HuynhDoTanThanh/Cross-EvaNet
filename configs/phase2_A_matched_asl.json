@@ -1,0 +1,23 @@
+{
+  "train_csv": "data/division_a/train_mv.csv",
+  "train_dir": "data/division_a/train",
+  "val_split": 0.1,
+  "split_csv": "configs/split_A.csv",
+  "pretrained": "outputs/phase1_A_matched_448_asl.pth",
+  "mv_init_ckpt": "weights/eva_x_base_patch16_merged520k_mim.pt",
+  "save_path": "outputs/phase2_A_matched_asl.pth",
+  "img_size": 448,
+  "num_views": 2,
+  "drop_path_rate": 0.2,
+  "fusion_head_type": "vaaf",
+  "single_view_route": true,
+  "batch_size": 10,
+  "lr": 0.0001,
+  "weight_decay": 0.05,
+  "epochs": 8,
+  "warmup_pct": 0.05,
+  "grad_accum_steps": 4,
+  "clip_grad": 1.0,
+  "loss": "asl",
+  "seed": 1337
+}

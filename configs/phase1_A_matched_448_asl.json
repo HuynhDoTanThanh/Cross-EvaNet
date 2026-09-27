@@ -1,0 +1,19 @@
+{
+  "train_csv": ["data/division_a/train_mv.csv"],
+  "train_dir": ["data/division_a/train"],
+  "split_csv": ["configs/split_A.csv"],
+  "val_split": 0.1,
+  "init_ckpt": "weights/eva_x_base_patch16_merged520k_mim.pt",
+  "save_path": "outputs/phase1_A_matched_448_asl.pth",
+  "img_size": 448,
+  "drop_path_rate": 0.2,
+  "batch_size": 16,
+  "lr": 0.0001,
+  "weight_decay": 0.05,
+  "epochs": 10,
+  "warmup_pct": 0.05,
+  "grad_accum_steps": 1,
+  "clip_grad": 1.0,
+  "loss": "asl",
+  "seed": 1337
+}

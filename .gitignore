@@ -27,7 +27,9 @@ outputs/
 *.pt
 *.ckpt
 *.csv
+# Persisted patient splits and study lists (e.g. configs/split_B.csv) are committed
 !configs/*.csv
+!configs/*.txt
 
 # Logs
 logs/
