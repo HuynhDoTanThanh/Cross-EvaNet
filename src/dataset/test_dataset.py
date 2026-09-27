@@ -106,6 +106,27 @@ class MultiViewEvalDataset(Dataset):
         return item
 
 
+class TestSingleViewDataset(Dataset):
+    """Every image of a test directory (jpg / png) on its own, in file-name order.
+
+    Used for single-view submissions: items are dicts with ``image`` [C, H, W]
+    and ``image_name`` (str); no pairing, no study grouping.
+    """
+
+    def __init__(self, root_dir: str, transform) -> None:
+        self.root_dir = root_dir
+        self.transform = transform
+        self.image_names = sorted(f for f in os.listdir(root_dir) if is_test_image(f))
+
+    def __len__(self) -> int:
+        return len(self.image_names)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        name = self.image_names[idx]
+        image = self.transform(load_rgb_image(os.path.join(self.root_dir, name)))
+        return {"image": image, "image_name": name}
+
+
 class TestMultiViewDataset(MultiViewEvalDataset):
     """Test dataset that discovers studies from a directory of images (jpg / png)."""
 

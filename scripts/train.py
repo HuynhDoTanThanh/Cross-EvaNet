@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Phase-2 training script for multi-view CheXray (Triple-Branch EVA).
-Supports TPU (Kaggle/Colab) via torch_xla, GPU and CPU.
+Supports TPU (torch_xla; reported runs on Kaggle TPU v3-8), GPU and CPU.
 
 E_s is loaded from the Phase-1 checkpoint (--pretrained, required) and frozen;
 E_m is initialised from EVA-X weights (--mv-init-ckpt, required). Training runs
@@ -9,7 +9,7 @@ the full epoch budget and saves the final-epoch checkpoint; validation AUC is
 logged each epoch for monitoring only.
 
 Usage:
-  # TPU (set TPU env or run on Kaggle)
+  # TPU
   python -m scripts.train --config configs/phase2_B_matched_apl.json --use-tpu
 
   # GPU / CPU

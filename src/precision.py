@@ -2,7 +2,8 @@
 
 bfloat16 autocast on XLA (TPU) with fp32 master weights; on CUDA bfloat16
 when supported, else float16 with a GradScaler; no autocast on CPU. Losses
-and sigmoids are computed in fp32 outside autocast by the callers.
+are computed in fp32 outside autocast by the callers, and evaluation
+sigmoids in float64 on the host.
 """
 
 import contextlib

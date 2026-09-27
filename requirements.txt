@@ -1,6 +1,6 @@
 # Python >= 3.10
 #
-# Exact versions still need to be pinned from the author's `pip freeze` of the TPU v4 run
+# Exact versions still need to be pinned from the author's `pip freeze` of the Kaggle TPU v3-8 run
 # (torch, torch_xla, torchvision, timm, opencv). The lower bounds below are the minimum the
 # code needs; it was smoke-tested on CPU with torch 2.8.0, torchvision 0.23.0 and timm 1.0.9.
 

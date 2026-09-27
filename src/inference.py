@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 import torch
+from scipy.special import expit
 
 from src.constants import LABEL_COLUMNS, NUM_LABELS
 from src.dataset.study import is_test_image, test_study_key
@@ -28,8 +29,9 @@ def run_inference(
 ) -> List[dict]:
     """Run a TripleBranchEVA over an evaluation loader, one record per pair.
 
-    Records hold ``study_key``, ``probs`` (sigmoid of the model output, fp32;
-    single-image studies get the single-view route when the model enables it)
+    Records hold ``study_key``, ``probs`` (sigmoid of the model output, in
+    float64 on the host so that large logits keep their ranking; single-image
+    studies get the single-view route when the model enables it)
     and ``single``; plus, when ``with_single_view``, ``view_probs`` [2, C] =
     sigmoid(y1), sigmoid(y2) (the frozen single-view prediction of each slot's
     image, same forward pass) and ``images`` (the two image names, slot order;
@@ -50,10 +52,10 @@ def run_inference(
             if with_single_view:
                 # One device-to-host transfer (on XLA each transfer executes the graph).
                 packed = torch.stack([output["logits"], output["logits_1"], output["logits_2"]]).float()
-                probs_np, probs_1, probs_2 = torch.sigmoid(packed).cpu().numpy()
+                probs_np, probs_1, probs_2 = expit(packed.cpu().numpy().astype(np.float64))
                 image_names = batch["image_names"]
             else:
-                probs_np = torch.sigmoid(output.float()).cpu().numpy()
+                probs_np = expit(output.float().cpu().numpy().astype(np.float64))
             single_np = batch["single"].cpu().numpy()
             labels_np = batch["labels"].float().cpu().numpy() if "labels" in batch else None
             for i, key in enumerate(study_keys):

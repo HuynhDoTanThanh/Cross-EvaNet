@@ -1,7 +1,7 @@
 """Dataset and data loading utilities."""
 
 from .train_dataset import MultiViewXRayDataset, SingleViewXRayDataset
-from .test_dataset import MultiViewEvalDataset, TestMultiViewDataset
+from .test_dataset import MultiViewEvalDataset, TestMultiViewDataset, TestSingleViewDataset
 from .transforms import build_transforms
 from .loaders import make_loaders
 from .splits import (
@@ -18,6 +18,7 @@ __all__ = [
     "SingleViewXRayDataset",
     "MultiViewEvalDataset",
     "TestMultiViewDataset",
+    "TestSingleViewDataset",
     "build_transforms",
     "make_loaders",
     "load_patient_split",

@@ -9,8 +9,8 @@ with study_id, patient_id and, for each label L, label_<L> (the study's
 labels), single_<L> (the frozen single-view encoder applied to that image
 alone) and fused_<L> (the Cross-EvaNet study prediction, Eq. (1), identical
 for all images of the study). Scores may be logits or probabilities (AUC is
-rank based). A per-study file (``--per-study``) also works; each row is then a
-study.
+rank based). The fused scores and labels must be constant within a study. A
+per-study file (``--per-study``) also works; each row is then a study.
 
 Protocol:
   - per-label AUC over the image rows; labels other than 0/1 (uncertain -1,
@@ -38,8 +38,9 @@ unformatted numbers, including Holm-adjusted DeLong p-values (``p_holm``, not
 reported in the paper), ``p_boot`` / ``z_boot`` and the number of resampling
 clusters.
 
-Only numpy / scipy / pandas (and sklearn in the self-check) are used, so the
-script runs without torch. Run it as a module from the repository root.
+Needs numpy, scipy, pandas and scikit-learn (through src.metrics), not torch.
+Clusters are numbered in sorted-id order, so the replicates do not depend on
+the row order of the input. Run it as a module from the repository root.
 
 Usage:
   python -m scripts.statistics --predictions outputs/chexpert_zeroshot_logits.csv \
@@ -75,8 +76,8 @@ TABLE_COLUMNS = [
 ]
 CORE5_ROW = "CheXpert Core 5 Benchmark Average"
 COUNT_COLUMNS = ["N images", "N studies", "N positive", "N negative"]
-# Study identifier of a row: study_id (per-image file) or study_key (earlier per-study file).
-STUDY_ID_COLUMNS = ("study_id", "study_key")
+# Study identifier of a row (per-image and --per-study files).
+STUDY_COLUMN = "study_id"
 BOOT_CHUNK = 100
 # Standard errors at or below this are treated as 0 (floating-point noise when
 # every replicate gives the same delta).
@@ -288,6 +289,8 @@ def analyze(
                 "n_excluded": int((~mask).sum()),
             }
         )
+        if idx.size == 0:  # no 0/1 target: the AUC stays NaN and the label is reported as n/a
+            continue
         for a in range(2):
             order, starts = _sorted_groups(scores[idx, c, a])
             positive = y[order] == 1
@@ -398,17 +401,20 @@ def format_table(raw: pd.DataFrame) -> pd.DataFrame:
 
 def load_predictions(path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str], pd.DataFrame]:
     """Labels, single and fused scores [N, C] of the N rows (images), label names and the table."""
-    df = pd.read_csv(path, dtype={c: str for c in STUDY_ID_COLUMNS + ("patient_id", "image")})
+    df = pd.read_csv(path, dtype={c: str for c in (STUDY_COLUMN, "patient_id", "image")})
     names = [c[len("label_"):] for c in df.columns if c.startswith("label_")]
     missing = [f"{arm}_{n}" for n in names for arm in ARMS if f"{arm}_{n}" not in df.columns]
     if not names or missing:
         raise ValueError(f"{path}: need label_<L>, single_<L> and fused_<L> columns (missing {missing})")
-    study_column = next((c for c in STUDY_ID_COLUMNS if c in df.columns), None)
-    if study_column is not None:
+    if STUDY_COLUMN in df.columns:
         # One row per image of a study (per-image file) or per study (per-study file).
-        key = [study_column, "image"] if "image" in df.columns else [study_column]
+        key = [STUDY_COLUMN, "image"] if "image" in df.columns else [STUDY_COLUMN]
         if df.duplicated(key).any():
             raise ValueError(f"{path}: duplicated rows for {key}")
+        if "image" in df.columns:
+            shared = [c for c in df.columns if c.startswith(("fused_", "label_"))]
+            if df.groupby(STUDY_COLUMN)[shared].nunique(dropna=False).gt(1).any().any():
+                raise ValueError(f"{path}: fused scores and labels must be constant within a study")
     labels = df[[f"label_{n}" for n in names]].to_numpy(dtype=np.float64)
     single = df[[f"single_{n}" for n in names]].to_numpy(dtype=np.float64)
     fused = df[[f"fused_{n}" for n in names]].to_numpy(dtype=np.float64)
@@ -418,24 +424,23 @@ def load_predictions(path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str
 
 
 def study_ids(df: pd.DataFrame) -> np.ndarray:
-    """Study index of each row (0..S-1): study_id, or study_key of a per-study file.
+    """Study index of each row (0..S-1, sorted study_id order).
 
-    Without either column every row is taken as its own study.
+    Without a study_id column every row is taken as its own study.
     """
-    for column in STUDY_ID_COLUMNS:
-        if column in df.columns:
-            return pd.factorize(df[column].astype(str))[0]
+    if STUDY_COLUMN in df.columns:
+        return pd.factorize(df[STUDY_COLUMN].astype(str), sort=True)[0]
     warnings.warn("no study_id column: every row is treated as its own study")
     return np.arange(len(df))
 
 
 def resampling_units(df: pd.DataFrame, level: str) -> np.ndarray:
-    """Bootstrap cluster of each row (image): its study, or its patient."""
+    """Bootstrap cluster of each row (image): its study, or its patient (sorted-id order)."""
     if level == "study":
         return study_ids(df)
     if "patient_id" not in df.columns:
         raise ValueError("--resample patient needs a patient_id column")
-    return pd.factorize(df["patient_id"].astype(str))[0]
+    return pd.factorize(df["patient_id"].astype(str), sort=True)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -579,18 +584,30 @@ def run_selftest() -> None:
     null = analyze(y, single, single, names, studies, n_boot=200, seed=42)
     assert np.allclose(null["delta"], 0) and np.allclose(null["p"], 1.0) and np.allclose(null["p_boot"], 1.0)
 
-    # 6. Input checks: a repeated (study, image) row is rejected; a per-study file
-    #    (study_key, one row per study) makes every row its own cluster.
-    dup = pd.concat([frame, frame.iloc[:1]])
-    try:
-        load_predictions(io.StringIO(dup.to_csv(index=False)))
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("duplicated image row accepted")
-    per_study = frame.drop_duplicates("study_id").rename(columns={"study_id": "study_key"}).drop(columns="image")
+    # 6. The replicates do not depend on the row order; a label without 0/1 targets is n/a.
+    shuffled = frame.sample(frac=1.0, random_state=3)
+    ys, ss, fs, _, df_s = load_predictions(io.StringIO(shuffled.to_csv(index=False)))
+    again = analyze(ys, ss, fs, names, resampling_units(df_s, "study"), n_boot=300, seed=42)
+    pd.testing.assert_frame_equal(raw, again)
+    y_na = y.copy()
+    y_na[:, -1] = -1
+    assert np.isnan(analyze(y_na, single, fused, names, studies, n_boot=50)["auc_fused"].iloc[-1])
+
+    # 7. Input checks: a repeated (study, image) row and a fused score that differs
+    #    within a study are rejected; a per-study file (one row per study) makes
+    #    every row its own cluster.
+    changed = frame.copy()
+    changed.loc[changed.index[changed["study_id"].duplicated()][0], f"fused_{names[0]}"] += 1.0
+    for bad in (pd.concat([frame, frame.iloc[:1]]), changed):
+        try:
+            load_predictions(io.StringIO(bad.to_csv(index=False)))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid per-image file accepted")
+    per_study = frame.drop_duplicates("study_id").drop(columns="image")
     *_, df_study = load_predictions(io.StringIO(per_study.to_csv(index=False)))
-    assert np.array_equal(resampling_units(df_study, "study"), np.arange(len(df_study)))
+    assert np.unique(resampling_units(df_study, "study")).size == len(df_study)
 
     print(table.to_string(index=False))
     print(f"{len(df)} images, {n_studies} studies, {patients.max() + 1} patients")

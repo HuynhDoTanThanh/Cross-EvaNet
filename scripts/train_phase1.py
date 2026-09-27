@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Phase-1 training script: single-view fine-tuning of the EVA-X ViT-B encoder.
-Supports TPU (Kaggle/Colab) via torch_xla, GPU and CPU.
+Supports TPU (torch_xla; reported runs on Kaggle TPU v3-8), GPU and CPU.
 
 The encoder is initialised from the public EVA-X masked-image-modelling
 weights (--init-ckpt; pos_embed resampled to the input grid) and fine-tuned

@@ -26,6 +26,7 @@ from src.constants import NUM_LABELS
 from src.dataset import TestMultiViewDataset, build_transforms
 from src.inference import aggregate_study_preds, build_submission, run_inference
 from src.models import load_triple_branch_model
+from src.precision import check_xla_mixed_precision_env
 
 
 def parse_args():
@@ -51,6 +52,7 @@ def main():
     args = parse_args()
     use_xla = args.use_tpu
     if use_xla:
+        check_xla_mixed_precision_env()
         import torch_xla.core.xla_model as xm
         import torch_xla.distributed.parallel_loader as pl
         device = xm.xla_device()

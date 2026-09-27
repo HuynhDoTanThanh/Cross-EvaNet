@@ -10,7 +10,7 @@ follows a two-phase curriculum:
   Attention Fusion (VAAF) head. The fused output corrects the frozen single-view prediction as
   a residual.
 
-All reported runs used a TPU v4 (`torch_xla`). The same code runs on CUDA GPUs and, for smoke
+All reported runs used a Kaggle TPU v3-8 (`torch_xla`). The same code runs on CUDA GPUs and, for smoke
 tests, on CPU.
 
 ![Cross-EvaNet architecture](images/architecture.png)
@@ -101,6 +101,7 @@ Cross-EvaNet/
 │   ├── train_phase1.py       # Phase 1: single-view fine-tuning
 │   ├── train.py              # Phase 2: multi-view fusion training
 │   ├── inference.py          # Grand X-Ray SLAM test inference and submission CSV
+│   ├── inference_single_view.py   # single-view submission from a Phase-1 checkpoint (each image alone)
 │   ├── build_chexpert_cohort.py   # CheXpert paired-study cohort
 │   ├── evaluate_chexpert.py       # per-image fused (study-level) + single-view logits (CheXpert or validation split)
 │   └── statistics.py              # study-cluster bootstrap CIs, paired DeLong, paired bootstrap
@@ -113,7 +114,7 @@ Cross-EvaNet/
     ├── inference.py          # run_inference, predict_images (per-image rows), submission building
     ├── dataset/
     │   ├── train_dataset.py  # SingleViewXRayDataset (Phase 1), MultiViewXRayDataset (Phase 2)
-    │   ├── test_dataset.py   # MultiViewEvalDataset (deterministic), TestMultiViewDataset
+    │   ├── test_dataset.py   # MultiViewEvalDataset (deterministic), TestMultiViewDataset, TestSingleViewDataset
     │   ├── study.py          # study grouping, pairing rules, study labels
     │   ├── splits.py         # label CSV reading, persisted patient split
     │   ├── transforms.py     # Strong Augment and validation transforms
@@ -141,9 +142,9 @@ pip install -r requirements.txt
 
 - **CUDA:** install the `torch` / `torchvision` build that matches your CUDA version first
   (https://pytorch.org), then `pip install -r requirements.txt`.
-- **TPU (Kaggle / Colab / Cloud TPU VM):** use a runtime that ships `torch_xla` matching its
-  `torch`, or install the matching `torch_xla` wheel. `torch_xla` is imported only when
-  `--use-tpu` is passed.
+- **TPU (Kaggle TPU v3-8 for the reported runs; Colab or Cloud TPU VM also work):** use a runtime that ships
+  `torch_xla` matching its `torch`, or install the matching `torch_xla` wheel. `torch_xla` is
+  imported only when `--use-tpu` is passed.
 
 `timm >= 0.9.6` is required, because the multi-view encoder uses `Eva._pos_embed` to obtain the
 RoPE embedding. EVA-X's own repository pins `timm==0.9.0`, which is too old for this code.
@@ -398,6 +399,22 @@ Other flags: `--img-size 448 --num-views 2 --batch-size 10 --num-workers 4`.
   (one prediction per study; the one image of a single-image study receives `sigmoid(y_1)`).
 - No test-time augmentation is used.
 
+**Single-view submission** (the single-view rows of Tables 5 and 7).
+`scripts/inference_single_view.py` loads a Phase-1 checkpoint strictly and scores every test image
+on its own with the validation transform: each image gets `sigmoid(y)` of that image, with no
+pairing and no averaging over the images of a study. The CSV has the same layout as above.
+
+```bash
+python -m scripts.inference_single_view \
+  --checkpoint outputs/phase1_B_matched_448.pth \
+  --test-dir data/division_b/test \
+  --output submissions/phase1_B_matched_448.csv \
+  [--img-size 224] [--use-tpu]
+```
+
+Other flags: `--batch-size 16 --num-workers 4`. Pass `--img-size 224` for a Phase-1 checkpoint
+trained at 224.
+
 ## Evaluation protocol (per image)
 
 All AUCs in this repository are computed **per image** (radiograph), the unit of the Grand X-Ray
@@ -416,8 +433,9 @@ SLAM leaderboard. Every image carries its study's labels.
   enter the replicate together (`--resample patient` resamples patients instead; an extra, not
   used in the paper). See step 3 of the CheXpert section.
 
-Both outputs come from one forward pass of the Phase-2 model, so they differ only in whether the
-fusion pathway is used. No test-time augmentation is used.
+Both outputs come from one forward pass of the Phase-2 model, so the comparison isolates the
+multi-view pathway: the study-level combination of both images (`1/2 * (y_1 + y_2)`) plus the
+fusion term `y'`, against each image's own `y_k`. No test-time augmentation is used.
 
 ## In-domain evaluation (paired validation studies)
 
@@ -454,7 +472,9 @@ python -m scripts.statistics --predictions outputs/divB_val_logits.csv \
 ```
 
 `--per-study` writes one row per study with the earlier comparator `1/2 * (y_1 + y_2)` instead. It
-is not the paper's protocol.
+is not the paper's protocol. `--include-single` also keeps the single-image validation studies
+(their one image gets `y_1` in both columns), i.e. all validation images as on the leaderboard;
+Table 6 uses the paired studies only.
 
 `scripts/train.py` also logs, after every epoch (via `src.train.evaluate`), the per-image macro
 AUC of the deployed output over all validation images and, on the images of paired studies, the
@@ -524,8 +544,12 @@ script reports:
 - The counts: images and studies overall, and per label the evaluable images and studies and
   the positive and negative images.
 
+The fused scores and labels of a per-image file must be constant within a study, and each
+(study, image) row must appear once. Clusters are numbered in sorted-id order, so the replicates
+do not depend on the row order of the file.
+
 The output follows the column layout of Table 8, followed by the columns `N images`, `N studies`,
-`N positive` and `N negative`. The script needs only numpy, scipy and pandas, not torch.
+`N positive` and `N negative`. The script needs numpy, scipy, pandas and scikit-learn, not torch.
 
 ```bash
 python -m scripts.statistics --predictions outputs/chexpert_zeroshot_logits.csv \
@@ -538,7 +562,7 @@ python -m scripts.statistics --selftest    # self-check on synthetic data
 | Paper result | How |
 |---|---|
 | Tables 5 and 7: multi-view rows | Phase 1 at 448 (matched or full) -> `scripts.train --config configs/phase2_<DIV>_<regime>_<loss>.json` -> `scripts.inference` -> Kaggle submission |
-| Tables 5 and 7: single-view rows (224 / 448) | Phase 1 at `--img-size 224` or 448 (a submission script for these rows is not included, see below) |
+| Tables 5 and 7: single-view rows (224 / 448) | Phase 1 at `--img-size 224` or 448 -> `scripts.inference_single_view` (each image scored alone) -> Kaggle submission |
 | Table 4: parameters | See the snippet below (89.88 M trainable, 176.19 M total) |
 | Table 6: per-label, validation | `scripts.evaluate_chexpert` in validation-split mode ([details](#in-domain-evaluation-paired-validation-studies)) |
 | Table 8: CheXpert zero-shot | [CheXpert zero-shot evaluation](#chexpert-zero-shot-evaluation) |
@@ -560,8 +584,6 @@ Not included in this repository:
 
 - the ResNet-152 / ViT-L-16 baselines and the Weak / Trivial Augment policies of Table 10;
 - the Grad-CAM figure (Fig. 2);
-- a script that writes a Kaggle submission from a Phase-1 (single-view) checkpoint.
-  `scripts/inference.py` needs a Phase-2 checkpoint.
 - the organiser-scored leaderboard. Kaggle computes it from the submission CSV, and its labels
   are not released.
 
@@ -569,14 +591,16 @@ Not included in this repository:
 
 - **TPU (`--use-tpu`):** `torch_xla` with `bfloat16` autocast. Master weights, gradients and
   AdamW state stay fp32. Do **not** set `XLA_USE_BF16=1` (or `XLA_DOWNCAST_BF16=1`): it would
-  run the whole model in pure bf16, so the training scripts stop with an error when it is set.
+  run the whole model in pure bf16, so the training, inference and evaluation scripts stop with an
+  error when it is set.
   - On XLA, the fusion path is computed for all rows and replaced by `y_1` for routed rows. This
     keeps shapes static, and the outputs are identical to skipping those rows.
   - The XLA RNG is seeded too.
 - **CUDA:** `bfloat16` autocast when the GPU supports it; otherwise `float16` with a GradScaler,
   which unscales before clipping.
 - **CPU:** fp32 without autocast. Suitable for smoke tests only.
-- **All devices:** losses and sigmoids are computed in fp32 outside autocast.
+- **All devices:** losses are computed in fp32 outside autocast; evaluation sigmoids in float64
+  on the host.
 - **Seeds:** training uses 1337 for the split, augmentation and initialisation; the statistics
   use 42.
 - **Memory:** a Phase-2 step processes 10 studies with 1,569 tokens each. If memory is short,

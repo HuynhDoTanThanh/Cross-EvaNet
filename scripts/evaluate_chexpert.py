@@ -29,6 +29,10 @@ Inputs (one of):
                   n > 2 images is scored on its n - 1 consecutive pairs, whose
                   fused sigmoid probabilities are averaged and written back as
                   logits; each image keeps its own single-view logits).
+                  ``--include-single`` also keeps single-image studies, whose
+                  one image gets y1 in both columns (the single-view route),
+                  i.e. all validation images as on the leaderboard; Table 6
+                  uses the paired studies only.
 
 No test-time augmentation; the validation transform is used unchanged.
 
@@ -65,7 +69,7 @@ from src.dataset.study import STUDY_COLUMNS, study_labels
 from src.inference import image_values, mean_by_study
 from src.metrics import macro_auc, per_label_auc
 from src.models import load_triple_branch_model
-from src.precision import autocast
+from src.precision import autocast, check_xla_mixed_precision_env
 
 Studies = List[Tuple[str, List[str]]]
 
@@ -83,6 +87,11 @@ def parse_args():
         action="store_true",
         help="One row per study with the comparator 0.5 * (y1 + y2) instead (earlier protocol, not the paper's)",
     )
+    p.add_argument(
+        "--include-single",
+        action="store_true",
+        help="Validation-split mode: also keep single-image studies (y1 in both columns); Table 6 uses paired studies only",
+    )
     p.add_argument("--img-size", type=int, default=448)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--num-workers", type=int, default=4)
@@ -98,6 +107,8 @@ def parse_args():
         p.error("give either --study-list or both --train-csv and --split-csv")
     if bool(args.train_csv) != bool(args.split_csv):
         p.error("--train-csv and --split-csv go together")
+    if args.include_single and args.study_list:
+        p.error("--include-single applies to the validation-split mode only")
     return args
 
 
@@ -115,13 +126,15 @@ def load_study_list(path: str) -> Tuple[Studies, List[str], np.ndarray]:
     return studies, df["patient_id"].tolist(), df[LABEL_COLUMNS].to_numpy(dtype=np.float32)
 
 
-def load_val_studies(train_csv: str, split_csv: str) -> Tuple[Studies, List[str], np.ndarray]:
-    """Validation studies with >= 2 images from the persisted patient split."""
+def load_val_studies(
+    train_csv: str, split_csv: str, min_images: int = 2
+) -> Tuple[Studies, List[str], np.ndarray]:
+    """Validation studies with >= ``min_images`` images from the persisted patient split."""
     if not os.path.exists(split_csv):
         raise FileNotFoundError(f"Split file {split_csv} not found; it is written by scripts/train.py")
     _, val_df = split_by_patient(read_train_csv(train_csv), split_csv)
     study_map = val_df.groupby(STUDY_COLUMNS)["Image_name"].apply(list)
-    study_map = study_map[study_map.apply(len) >= 2]
+    study_map = study_map[study_map.apply(len) >= min_images]
     keys = list(study_map.index)
     studies = [(f"{pid}_{study}", sorted(str(name) for name in study_map[(pid, study)])) for pid, study in keys]
     labels = study_labels(val_df, LABEL_COLUMNS).loc[keys].to_numpy(dtype=np.float32)
@@ -231,6 +244,7 @@ def main():
     args = parse_args()
     use_xla = args.use_tpu
     if use_xla:
+        check_xla_mixed_precision_env()
         import torch_xla.core.xla_model as xm
         import torch_xla.distributed.parallel_loader as pl
         device = xm.xla_device()
@@ -243,8 +257,11 @@ def main():
     if args.study_list:
         studies, patient_ids, labels = load_study_list(args.study_list)
     else:
-        studies, patient_ids, labels = load_val_studies(args.train_csv, args.split_csv)
-    log(f"{len(studies)} paired studies, {sum(len(names) for _, names in studies)} images")
+        studies, patient_ids, labels = load_val_studies(
+            args.train_csv, args.split_csv, min_images=1 if args.include_single else 2
+        )
+    n_paired = sum(len(names) >= 2 for _, names in studies)
+    log(f"{len(studies)} studies ({n_paired} with >= 2 images), {sum(len(names) for _, names in studies)} images")
 
     _, val_tf = build_transforms(args.img_size)
     dataset = MultiViewEvalDataset(studies, args.image_root, val_tf, labels=labels)

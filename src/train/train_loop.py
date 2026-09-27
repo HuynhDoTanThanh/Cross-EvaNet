@@ -5,6 +5,7 @@ from typing import Any, Dict
 
 import numpy as np
 import torch
+from scipy.special import expit
 
 from src.inference import predict_images
 from src.metrics import macro_auc, per_label_auc
@@ -94,8 +95,7 @@ def evaluate(model, loader, device, use_xla: bool = False) -> Dict[str, Any]:
       vs. the frozen single-view prediction y_k of each image on its own.
 
     Counts: ``n_images`` / ``n_studies`` (all), ``n_paired_images`` /
-    ``n_paired`` (images and studies of paired studies). The keys of the
-    earlier study-level version are kept; their AUCs are now per image.
+    ``n_paired`` (images and studies of paired studies).
     """
     preds = predict_images(model, loader, device, use_xla=use_xla)
     labels, paired = preds["labels"], preds["paired"]
@@ -127,9 +127,10 @@ def evaluate_single_view(model, loader, device) -> Dict[str, Any]:
         imgs = imgs.to(device, non_blocking=True)
         with autocast(device):
             logits = model(imgs)
-        all_probs.append(torch.sigmoid(logits.float()).cpu())
+        all_probs.append(logits.float().cpu())
         all_labels.append(labels.float().cpu())
-    probs = torch.cat(all_probs, dim=0).numpy()
+    # Sigmoid in float64 on the host, so that large logits keep their ranking.
+    probs = expit(torch.cat(all_probs, dim=0).numpy().astype(np.float64))
     labels = torch.cat(all_labels, dim=0).numpy()
     per_class_auc = per_label_auc(labels, probs)
     return {"macro_auc": macro_auc(per_class_auc), "per_class_auc": per_class_auc}
